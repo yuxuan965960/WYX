@@ -1,30 +1,1355 @@
-name: Xcode - Build and Analyze
-
-on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-jobs:
-  build:
-    name: Build and analyse default scheme using xcodebuild command
-    runs-on: macos-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Set Default Scheme
-        run: |
-          scheme_list=$(xcodebuild -list -json | tr -d "\n")
-          default=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-          echo $default | cat >default
-          echo Using default scheme: $default
-      - name: Build
-        env:
-          scheme: ${{ 'default' }}
-        run: |
-          if [ $scheme = default ]; then scheme=$(cat default); fi
-          if [ "`ls -A | grep -i \\.xcworkspace\$`" ]; then filetype_parameter="workspace" && file_to_build="`ls -A | grep -i \\.xcworkspace\$`"; else filetype_parameter="project" && file_to_build="`ls -A | grep -i \\.xcodeproj\$`"; fi
-          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
-          xcodebuild clean build analyze -scheme "$scheme" -"$filetype_parameter" "$file_to_build" | xcpretty && exit ${PIPESTATUS[0]}
+diff --git a/.github/workflows/build-tipa.yml b/.github/workflows/build-tipa.yml
+new file mode 100644
+index 0000000..3fd7d96
+--- /dev/null
++++ b/.github/workflows/build-tipa.yml
+@@ -0,0 +1,68 @@
++name: Build TIPA
++
++on:
++  workflow_dispatch:
++
++env:
++  THEOS: ""
++  VERSION: "0.0.0-0"
++
++jobs:
++  build:
++    runs-on: macos-14
++    steps:
++      - name: Setup Xcode
++        uses: maxim-lobanov/setup-xcode@v1
++        with:
++          xcode-version: '15.4'
++
++      - name: Checkout Repository
++        uses: actions/checkout@v4.1.1
++
++      - name: Install Dependencies
++        run: |
++          echo /usr/local/opt/make/libexec/gnubin >> $GITHUB_PATH
++          echo /opt/homebrew/opt/make/libexec/gnubin >> $GITHUB_PATH
++          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 brew install dpkg ldid-procursus make xcbeautify openssl@3
++          VERSION_FILE="TrollFools/Version.xcconfig"
++          VERSION_MAIN=$(grep "VERSION" $VERSION_FILE | cut -d'=' -f2 | tr -d '[:space:]')
++          VERSION_BUILD=$(grep "BUILD_NUMBER" $VERSION_FILE | cut -d'=' -f2 | tr -d '[:space:]')
++          VERSION=$VERSION_MAIN-$VERSION_BUILD
++          echo "VERSION=$VERSION" >> $GITHUB_ENV
++          echo "Version: $VERSION"
++
++      - name: Checkout THEOS
++        uses: actions/checkout@v4.1.1
++        with:
++          repository: theos/theos
++          ref: 942cd0c015f93d8c2d714ba0c69e7f420157c382
++          path: theos
++          submodules: recursive
++
++      - name: Add THEOS environment variables
++        run: |
++          rm -rf $GITHUB_WORKSPACE/theos/sdks
++          echo "THEOS=$GITHUB_WORKSPACE/theos" >> $GITHUB_ENV
++          echo "THEOS_PACKAGE_SCHEME=rootless" >> $GITHUB_ENV
++          echo "FINALPACKAGE=1" >> $GITHUB_ENV
++
++      - name: Checkout SDKs
++        uses: actions/checkout@v4.1.1
++        with:
++          repository: theos/sdks
++          ref: master
++          path: ${{ env.THEOS }}/sdks
++
++      - name: Build Packages
++        run: |
++          make package
++          cp packages/*.tipa .
++          cp packages/*.deb .
++
++      - name: Upload Packages
++        uses: actions/upload-artifact@v4
++        with:
++          name: TrollFools-${{ env.VERSION }}
++          path: |
++            *.tipa
++            *.deb
+diff --git a/TrollFools/EjectListModel.swift b/TrollFools/EjectListModel.swift
+index c1e7479..5b72fa7 100644
+--- a/TrollFools/EjectListModel.swift
++++ b/TrollFools/EjectListModel.swift
+@@ -6,6 +6,7 @@
+ //
+ 
+ import Combine
++import Foundation
+ import SwiftUI
+ 
+ final class EjectListModel: ObservableObject {
+@@ -37,12 +38,12 @@ final class EjectListModel: ObservableObject {
+     func reload() {
+         var plugIns = [InjectedPlugIn]()
+         plugIns += InjectorV3.main.injectedAssetURLsInBundle(app.url)
+-            .map { InjectedPlugIn(url: $0, isEnabled: true) }
++            .map { InjectedPlugIn(url: $0, isEnabled: true, alias: alias(for: $0)) }
+ 
+         let enabledNames = plugIns.map { $0.url.lastPathComponent }
+         plugIns += InjectorV3.main.persistedAssetURLs(bid: app.bid)
+             .filter { !enabledNames.contains($0.lastPathComponent) }
+-            .map { InjectedPlugIn(url: $0, isEnabled: false) }
++            .map { InjectedPlugIn(url: $0, isEnabled: false, alias: alias(for: $0)) }
+ 
+         injectedPlugIns = plugIns
+             .sorted { $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending }
+@@ -55,7 +56,7 @@ final class EjectListModel: ObservableObject {
+ 
+         if !filter.searchKeyword.isEmpty {
+             filteredPlugIns = filteredPlugIns.filter {
+-                $0.url.lastPathComponent.localizedCaseInsensitiveContains(filter.searchKeyword)
++                $0.displayName.localizedCaseInsensitiveContains(filter.searchKeyword)
+             }
+         }
+ 
+@@ -70,4 +71,32 @@ final class EjectListModel: ObservableObject {
+         }
+         processingPlugIn = plugIn
+     }
++
++    // MARK: - Alias
++
++    private func aliasKey(for url: URL) -> String {
++        "PlugInAlias-\(app.bid)-\(url.lastPathComponent)"
++    }
++
++    func alias(for url: URL) -> String? {
++        guard let value = UserDefaults.standard.string(forKey: aliasKey(for: url)),
++              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
++        else {
++            return nil
++        }
++        return value
++    }
++
++    func setAlias(_ alias: String?, for plugIn: InjectedPlugIn) {
++        let trimmed = alias?.trimmingCharacters(in: .whitespacesAndNewlines)
++        let key = aliasKey(for: plugIn.url)
++
++        if let trimmed, !trimmed.isEmpty {
++            UserDefaults.standard.set(trimmed, forKey: key)
++        } else {
++            UserDefaults.standard.removeObject(forKey: key)
++        }
++
++        reload()
++    }
+ }
+diff --git a/TrollFools/EjectListView.swift b/TrollFools/EjectListView.swift
+index ae0c54c..7f9ecae 100644
+--- a/TrollFools/EjectListView.swift
++++ b/TrollFools/EjectListView.swift
+@@ -8,8 +8,21 @@
+ import CocoaLumberjackSwift
+ import SwiftUI
+ import SwiftUIIntrospect
++import UniformTypeIdentifiers
+ import ZIPFoundation
+ 
++enum PlugInSheetTarget: Identifiable {
++    case rename(InjectedPlugIn)
++    case framework(InjectedPlugIn)
++
++    var id: String {
++        switch self {
++        case let .rename(plugIn): "rename-\(plugIn.id)"
++        case let .framework(plugIn): "framework-\(plugIn.id)"
++        }
++    }
++}
++
+ struct EjectListView: View {
+     @StateObject var searchViewModel = AppListSearchModel()
+     @StateObject var ejectList: EjectListModel
+@@ -22,6 +35,10 @@ struct EjectListView: View {
+     @State var isErrorOccurred = false
+     @State var lastError: Error?
+ 
++    @State var activeSheet: PlugInSheetTarget?
++    @State var replaceTarget: InjectedPlugIn?
++    @State var isReplaceImporterPresented = false
++
+     @State var isWarningPresented = false
+ 
+     @StateObject var viewControllerHost = ViewControllerHost()
+@@ -74,6 +91,31 @@ struct EjectListView: View {
+             .toolbar { toolbarContent }
+             .animation(.easeOut, value: isExportingAll)
+             .quickLookPreview($quickLookExport)
++            .sheet(item: $activeSheet) { target in
++                sheetContent(for: target)
++            }
++            .fileImporter(
++                isPresented: $isReplaceImporterPresented,
++                allowedContentTypes: [.data],
++                allowsMultipleSelection: true
++            ) { result in
++                handleReplaceSelection(result)
++            }
++    }
++
++    @ViewBuilder
++    private func sheetContent(for target: PlugInSheetTarget) -> some View {
++        switch target {
++        case let .rename(plugIn):
++            PlugInRenameView(plugIn: plugIn)
++                .environmentObject(ejectList)
++
++        case let .framework(plugIn):
++            PlugInFrameworkView(app: ejectList.app, plugIn: plugIn) { _ in
++                ejectList.app.reload()
++                ejectList.reload()
++            }
++        }
+     }
+ 
+     @ViewBuilder
+@@ -319,15 +361,116 @@ struct EjectListView: View {
+     @ViewBuilder
+     private func deletablePlugInCell(_ plugin: InjectedPlugIn) -> some View {
+         if #available(iOS 16, *) {
+-            PlugInCell(plugin, quickLookExport: $quickLookExport)
+-                .environmentObject(ejectList)
++            plugInCell(plugin)
+         } else {
+-            PlugInCell(plugin, quickLookExport: $quickLookExport)
+-                .environmentObject(ejectList)
++            plugInCell(plugin)
+                 .padding(.vertical, 4)
+         }
+     }
+ 
++    private func plugInCell(_ plugin: InjectedPlugIn) -> some View {
++        PlugInCell(
++            plugin,
++            quickLookExport: $quickLookExport,
++            onRenameRequest: { activeSheet = .rename($0) },
++            onReplaceRequest: {
++                replaceTarget = $0
++                isReplaceImporterPresented = true
++            },
++            onFrameworkRequest: { activeSheet = .framework($0) }
++        )
++        .environmentObject(ejectList)
++    }
++
++    private func makeInjector() throws -> InjectorV3 {
++        let injector = try InjectorV3(ejectList.app.url)
++
++        if injector.appID.isEmpty {
++            injector.appID = ejectList.app.bid
++        }
++
++        if injector.teamID.isEmpty {
++            injector.teamID = ejectList.app.teamID
++        }
++
++        injector.useWeakReference = useWeakReference
++        injector.preferMainExecutable = preferMainExecutable
++        injector.useFrameworkEnumerationFallback = useFrameworkEnumerationFallback
++        injector.injectStrategy = injectStrategy
++
++        return injector
++    }
++
++    private func report(_ error: Error, logFileURL: URL?) {
++        DDLogError("\(error)", ddlog: InjectorV3.main.logger)
++
++        var userInfo: [String: Any] = [
++            NSLocalizedDescriptionKey: error.localizedDescription,
++        ]
++
++        if let logFileURL {
++            userInfo[NSURLErrorKey] = logFileURL
++        }
++
++        lastError = NSError(domain: Constants.gErrorDomain, code: 0, userInfo: userInfo)
++        isErrorOccurred = true
++    }
++
++    private func handleReplaceSelection(_ result: Result<[URL], Error>) {
++        guard let plugIn = replaceTarget else {
++            return
++        }
++
++        replaceTarget = nil
++
++        switch result {
++        case let .success(urls):
++            guard let sourceURL = urls.first else {
++                return
++            }
++            performReplace(plugIn, with: sourceURL)
++
++        case let .failure(error):
++            report(error, logFileURL: nil)
++        }
++    }
++
++    private func performReplace(_ plugIn: InjectedPlugIn, with sourceURL: URL) {
++        let needsSecurityScope = sourceURL.startAccessingSecurityScopedResource()
++        defer {
++            if needsSecurityScope {
++                sourceURL.stopAccessingSecurityScopedResource()
++            }
++        }
++
++        var logFileURL: URL?
++
++        do {
++            let injector = try makeInjector()
++            logFileURL = injector.latestLogFileURL
++
++            let preparedAssets = try injector.preprocessAssets([sourceURL])
++
++            guard let assetURL = preparedAssets.first else {
++                throw InjectorV3.Error.generic(NSLocalizedString("No valid plug-ins found.", comment: ""))
++            }
++
++            if assetURL.pathExtension.lowercased() == plugIn.url.pathExtension.lowercased() {
++                try injector.replaceAsset(at: plugIn.url, with: assetURL)
++            } else {
++                if plugIn.isEnabled {
++                    try injector.eject([plugIn.url], shouldDesist: false)
++                }
++                try injector.inject([assetURL], shouldPersist: false)
++            }
++
++            ejectList.app.reload()
++            ejectList.reload()
++        } catch {
++            report(error, logFileURL: logFileURL)
++        }
++    }
++
+     private func deletePlugIns(at offsets: IndexSet) {
+         var logFileURL: URL?
+ 
+diff --git a/TrollFools/InjectedPlugIn.swift b/TrollFools/InjectedPlugIn.swift
+index 5e8a8d9..8cd5d0b 100644
+--- a/TrollFools/InjectedPlugIn.swift
++++ b/TrollFools/InjectedPlugIn.swift
+@@ -12,11 +12,17 @@ struct InjectedPlugIn: Equatable, Identifiable, Hashable {
+     let url: URL
+     let createdAt: Date
+     let isEnabled: Bool
++    let alias: String?
+ 
+-    init(url: URL, isEnabled: Bool) {
++    var displayName: String {
++        alias ?? url.lastPathComponent
++    }
++
++    init(url: URL, isEnabled: Bool, alias: String? = nil) {
+         self.id = url.absoluteString
+         self.url = url
+         self.createdAt = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+         self.isEnabled = isEnabled
++        self.alias = alias
+     }
+ }
+diff --git a/TrollFools/InjectorV3+Inject.swift b/TrollFools/InjectorV3+Inject.swift
+index 645db9a..9cafcb2 100644
+--- a/TrollFools/InjectorV3+Inject.swift
++++ b/TrollFools/InjectorV3+Inject.swift
+@@ -272,3 +272,249 @@ extension InjectorV3 {
+         fatalError("Unable to locate resource \(name)")
+     }
+ }
++
++// MARK: - Plug-In Structure
++
++enum PlugInStructureKind: String {
++    case dylib
++    case framework
++    case bundle
++    case unsupported
++
++    var localizedName: String {
++        switch self {
++        case .dylib: NSLocalizedString("Dylib", comment: "")
++        case .framework: NSLocalizedString("Framework", comment: "")
++        case .bundle: NSLocalizedString("Bundle", comment: "")
++        case .unsupported: NSLocalizedString("Unknown", comment: "")
++        }
++    }
++}
++
++extension InjectorV3 {
++    // MARK: - Inspection
++
++    func structureKindOfAsset(_ assetURL: URL) -> PlugInStructureKind {
++        switch assetURL.pathExtension.lowercased() {
++        case "dylib": .dylib
++        case "framework": .framework
++        case "bundle": .bundle
++        default: .unsupported
++        }
++    }
++
++    func analyzeBundleStructure() -> BundleStructureReport {
++        BundleStructureReport(bundleURL: bundleURL, entries: structureEntriesInBundle())
++    }
++
++    /// Snapshot of every Mach-O inside the target bundle: architectures, encryption,
++    /// loaded dylibs and runtime paths.
++    func analyzeBundleStructure() -> BundleStructureReport {
++        BundleStructureReport(bundleURL: bundleURL, entries: structureEntriesInBundle())
++    }
++
++    // MARK: - Restructure
++
++    /// Relocates a bare dylib into a proper `XXX.framework` bundle and rewrites every
++    /// load command that used to point at the bare dylib.
++    @discardableResult
++    func convertAssetToFramework(_ assetURL: URL) throws -> URL {
++        guard structureKindOfAsset(assetURL) == .dylib else {
++            throw Error.generic(NSLocalizedString("This plug-in is not a dylib.", comment: ""))
++        }
++
++        try checkAssetIsInjected(assetURL)
++
++        guard FileManager.default.fileExists(atPath: assetURL.path) else {
++            throw Error.generic(String(format: NSLocalizedString("Plug-in not found: %@", comment: ""), assetURL.lastPathComponent))
++        }
++
++        terminateApp()
++
++        let baseName = assetURL.deletingPathExtension().lastPathComponent
++        let frameworkURL = frameworksDirectoryURL
++            .appendingPathComponent(baseName, isDirectory: false)
++            .appendingPathExtension("framework")
++        let frameworkMachOURL = frameworkURL.appendingPathComponent(baseName, isDirectory: false)
++
++        let oldItemName = assetURL.lastPathComponent
++        let newLoadCommandName = "@rpath/\(baseName).framework/\(baseName)"
++
++        let references = loadCommandReferences(matching: oldItemName)
++        let previousLoadCommands = references.map { ($0.target, $0.name) }
++
++        if FileManager.default.fileExists(atPath: frameworkURL.path) {
++            try cmdRemove(frameworkURL, recursively: true)
++        }
++
++        do {
++            try cmdMakeDirectory(at: frameworkURL)
++            try cmdCopy(from: assetURL, to: frameworkMachOURL)
++            try installFrameworkInfoPlist(at: frameworkURL, executableName: baseName)
++            try markBundlesAsInjected([frameworkURL], privileged: true)
++
++            try rewriteLoadCommands(references, to: newLoadCommandName)
++            try cmdRemove(assetURL)
++
++            try applyCoreTrustBypass(frameworkURL)
++            for target in uniqueTargets(references.map { $0.target }) {
++                try applyCoreTrustBypass(target)
++            }
++        } catch {
++            try? cmdRemove(frameworkURL, recursively: true)
++            for (target, name) in previousLoadCommands {
++                try? cmdChangeLoadCommandDylib(target, from: newLoadCommandName, to: name)
++            }
++            throw error
++        }
++
++        DDLogInfo("Restructured \(oldItemName) as \(frameworkURL.lastPathComponent)", ddlog: logger)
++
++        return frameworkURL
++    }
++
++    /// The opposite of `convertAssetToFramework(_:)`: flattens a framework back into a bare dylib.
++    @discardableResult
++    func convertAssetToDylib(_ assetURL: URL) throws -> URL {
++        guard structureKindOfAsset(assetURL) == .framework else {
++            throw Error.generic(NSLocalizedString("This plug-in is not a framework.", comment: ""))
++        }
++
++        try checkAssetIsInjected(assetURL)
++
++        guard FileManager.default.fileExists(atPath: assetURL.path) else {
++            throw Error.generic(String(format: NSLocalizedString("Plug-in not found: %@", comment: ""), assetURL.lastPathComponent))
++        }
++
++        terminateApp()
++
++        let baseName = assetURL.deletingPathExtension().lastPathComponent
++        let frameworkMachOURL = try locateExecutableInBundle(assetURL)
++        let dylibURL = frameworksDirectoryURL
++            .appendingPathComponent(baseName, isDirectory: false)
++            .appendingPathExtension("dylib")
++
++        let oldItemName = "\(baseName).framework/\(baseName)"
++        let newLoadCommandName = "@rpath/\(baseName).dylib"
++
++        let references = loadCommandReferences(matching: oldItemName)
++        let previousLoadCommands = references.map { ($0.target, $0.name) }
++
++        if FileManager.default.fileExists(atPath: dylibURL.path) {
++            try cmdRemove(dylibURL)
++        }
++
++        do {
++            try cmdCopy(from: frameworkMachOURL, to: dylibURL)
++
++            try rewriteLoadCommands(references, to: newLoadCommandName)
++            try cmdRemove(assetURL, recursively: true)
++
++            try applyCoreTrustBypass(dylibURL)
++            for target in uniqueTargets(references.map { $0.target }) {
++                try applyCoreTrustBypass(target)
++            }
++        } catch {
++            try? cmdRemove(dylibURL)
++            for (target, name) in previousLoadCommands {
++                try? cmdChangeLoadCommandDylib(target, from: newLoadCommandName, to: name)
++            }
++            throw error
++        }
++
++        DDLogInfo("Restructured \(baseName).framework as \(dylibURL.lastPathComponent)", ddlog: logger)
++
++        return dylibURL
++    }
++
++    /// Swaps the contents of an already injected plug-in in place, keeping its load command untouched.
++    func replaceAsset(at oldURL: URL, with newURL: URL) throws {
++        guard FileManager.default.fileExists(atPath: oldURL.path) else {
++            throw Error.generic(String(format: NSLocalizedString("Plug-in not found: %@", comment: ""), oldURL.lastPathComponent))
++        }
++
++        terminateApp()
++
++        let newIsDirectory = checkIsDirectory(newURL)
++        try cmdRemove(oldURL, recursively: checkIsDirectory(oldURL))
++        try cmdCopy(from: newURL, to: oldURL, overwrite: true)
++        try cmdChangeOwnerToInstalld(oldURL, recursively: newIsDirectory)
++        try applyCoreTrustBypass(oldURL)
++    }
++
++    // MARK: - Private Helpers
++
++    /// Every Mach-O whose load commands reference the given item name,
++    /// either as a bare item (`Foo.dylib`) or as a nested framework item (`Foo.framework/Foo`).
++    fileprivate func loadCommandReferences(matching itemName: String) -> [(target: URL, name: String)] {
++        var targets = [executableURL]
++        targets.append(contentsOf: machOsInFrameworksDirectory())
++
++        var references = [(target: URL, name: String)]()
++        for target in uniqueTargets(targets) {
++            guard let dylibs = try? loadedDylibsOfMachO(target) else {
++                continue
++            }
++            for name in dylibs where name == itemName || name.hasSuffix("/" + itemName) {
++                references.append((target, name))
++            }
++        }
++        return references
++    }
++
++    fileprivate func rewriteLoadCommands(_ references: [(target: URL, name: String)], to newName: String) throws {
++        for reference in references {
++            try cmdInsertLoadCommandRuntimePath(reference.target, name: "@executable_path/Frameworks")
++            try cmdChangeLoadCommandDylib(reference.target, from: reference.name, to: newName)
++        }
++    }
++
++    fileprivate func uniqueTargets(_ targets: [URL]) -> [URL] {
++        var seen = Set<String>()
++        var results = [URL]()
++        for target in targets where !seen.contains(target.path) {
++            seen.insert(target.path)
++            results.append(target)
++        }
++        return results
++    }
++
++    /// Restructuring only makes sense for assets that already live inside the target bundle.
++    fileprivate func checkAssetIsInjected(_ assetURL: URL) throws {
++        let prefix = frameworksDirectoryURL.path + "/"
++        guard assetURL.path.hasPrefix(prefix),
++              FileManager.default.fileExists(atPath: assetURL.path)
++        else {
++            throw Error.generic(NSLocalizedString("Only injected plug-ins can be restructured.", comment: ""))
++        }
++    }
++
++    fileprivate func installFrameworkInfoPlist(at frameworkURL: URL, executableName: String) throws {
++        let plist: [String: Any] = [
++            "CFBundleDevelopmentRegion": "en",
++            "CFBundleExecutable": executableName,
++            "CFBundleIdentifier": "com.trollfools.injected.\(executableName.lowercased())",
++            "CFBundleInfoDictionaryVersion": "6.0",
++            "CFBundleName": executableName,
++            "CFBundlePackageType": "FMWK",
++            "CFBundleShortVersionString": "1.0.0",
++            "CFBundleVersion": "1",
++            "MinimumOSVersion": "14.0",
++        ]
++
++        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
++
++        let temporaryPlistURL = temporaryDirectoryURL
++            .appendingPathComponent("\(UUID().uuidString)-Info.plist")
++        try data.write(to: temporaryPlistURL, options: .atomic)
++        defer {
++            try? FileManager.default.removeItem(at: temporaryPlistURL)
++        }
++
++        try cmdCopy(
++            from: temporaryPlistURL,
++            to: frameworkURL.appendingPathComponent("Info.plist"),
++            overwrite: true
++        )
++    }
++}
+diff --git a/TrollFools/InjectorV3+MachO.swift b/TrollFools/InjectorV3+MachO.swift
+index e5ff2fb..06466e1 100644
+--- a/TrollFools/InjectorV3+MachO.swift
++++ b/TrollFools/InjectorV3+MachO.swift
+@@ -176,3 +176,196 @@ extension InjectorV3 {
+         return resolvedURL
+     }
+ }
++
++// MARK: - Structure Inspection
++
++struct MachOStructureEntry: Identifiable {
++    let id: String
++    let url: URL
++    let relativePath: String
++    let architectures: [String]
++    let isEncrypted: Bool
++    let isMainExecutable: Bool
++    let fileSize: Int64
++    let loadedDylibs: [String]
++    let runtimePaths: [String]
++    let hasBackup: Bool
++
++    var architecturesDescription: String {
++        architectures.isEmpty ? NSLocalizedString("Unknown", comment: "") : architectures.joined(separator: ", ")
++    }
++
++    var fileSizeDescription: String {
++        ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
++    }
++}
++
++struct BundleStructureReport {
++    let bundleURL: URL
++    let entries: [MachOStructureEntry]
++}
++
++extension InjectorV3 {
++    /// Reads the CPU architecture list of a Mach-O file without loading it into memory.
++    func architecturesOfMachO(_ target: URL) -> [String] {
++        guard let handle = try? FileHandle(forReadingFrom: target) else {
++            return []
++        }
++        defer {
++            try? handle.close()
++        }
++
++        guard let data = try? handle.read(upToCount: 4096), data.count >= 8 else {
++            return []
++        }
++
++        let bytes = [UInt8](data)
++
++        func bigEndian(_ offset: Int) -> UInt32? {
++            guard offset + 4 <= bytes.count else {
++                return nil
++            }
++            return UInt32(bytes[offset]) << 24
++                | UInt32(bytes[offset + 1]) << 16
++                | UInt32(bytes[offset + 2]) << 8
++                | UInt32(bytes[offset + 3])
++        }
++
++        func littleEndian(_ offset: Int) -> UInt32? {
++            guard offset + 4 <= bytes.count else {
++                return nil
++            }
++            return UInt32(bytes[offset + 3]) << 24
++                | UInt32(bytes[offset + 2]) << 16
++                | UInt32(bytes[offset + 1]) << 8
++                | UInt32(bytes[offset])
++        }
++
++        guard let magic = bigEndian(0) else {
++            return []
++        }
++
++        switch magic {
++        case 0xFEED_FACE, 0xFEED_FACF:
++            guard let cpuType = littleEndian(4), let cpuSubtype = littleEndian(8) else {
++                return []
++            }
++            return [Self.cpuTypeDescription(cpuType: cpuType, cpuSubtype: cpuSubtype)]
++
++        case 0xCEFA_EDFE, 0xCFFA_EDFE:
++            guard let cpuType = bigEndian(4), let cpuSubtype = bigEndian(8) else {
++                return []
++            }
++            return [Self.cpuTypeDescription(cpuType: cpuType, cpuSubtype: cpuSubtype)]
++
++        case 0xCAFE_BABE, 0xCAFE_BABF:
++            guard let count = bigEndian(4) else {
++                return []
++            }
++
++            let entrySize = (magic == 0xCAFE_BABF) ? 32 : 20
++            var architectures = [String]()
++            for index in 0 ..< Int(min(count, 16)) {
++                let offset = 8 + index * entrySize
++                guard let cpuType = bigEndian(offset), let cpuSubtype = bigEndian(offset + 4) else {
++                    break
++                }
++                architectures.append(Self.cpuTypeDescription(cpuType: cpuType, cpuSubtype: cpuSubtype))
++            }
++            return architectures
++
++        default:
++            return []
++        }
++    }
++
++    /// Every Mach-O that lives directly inside the `Frameworks` directory of the target bundle.
++    /// Bare dylibs are returned as-is, frameworks are resolved to their executable file.
++    func machOsInFrameworksDirectory() -> [URL] {
++        guard let contents = try? FileManager.default.contentsOfDirectory(
++            at: frameworksDirectoryURL,
++            includingPropertiesForKeys: [.isDirectoryKey],
++            options: [.skipsHiddenFiles]
++        ) else {
++            return []
++        }
++
++        var urls = [URL]()
++        for item in contents {
++            if item.pathExtension.lowercased() == "framework" {
++                if let executableURL = try? locateExecutableInBundle(item), isMachO(executableURL) {
++                    urls.append(executableURL)
++                }
++                continue
++            }
++            if isMachO(item) {
++                urls.append(item)
++            }
++        }
++
++        return urls.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
++    }
++
++    /// Mach-O entries of the main executable plus everything inside `Frameworks`.
++    func structureEntriesInBundle() -> [MachOStructureEntry] {
++        var urls = [URL]()
++        if isMachO(executableURL) {
++            urls.append(executableURL)
++        }
++        urls.append(contentsOf: machOsInFrameworksDirectory())
++
++        var seen = Set<String>()
++        var entries = [MachOStructureEntry]()
++        for url in urls where !seen.contains(url.path) {
++            seen.insert(url.path)
++            if let entry = structureEntry(for: url) {
++                entries.append(entry)
++            }
++        }
++        return entries
++    }
++
++    func structureEntry(for url: URL) -> MachOStructureEntry? {
++        guard isMachO(url) else {
++            return nil
++        }
++
++        let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
++
++        let prefix = bundleURL.path.hasSuffix("/") ? bundleURL.path : bundleURL.path + "/"
++        let relativePath = url.path.hasPrefix(prefix)
++            ? String(url.path.dropFirst(prefix.count))
++            : url.lastPathComponent
++
++        let loadedDylibs: [String] = (try? loadedDylibsOfMachO(url)).map { Array($0.elements) } ?? []
++        let runtimePaths: [String] = (try? runtimePathsOfMachO(url)).map { Array($0.elements) } ?? []
++
++        return MachOStructureEntry(
++            id: url.path,
++            url: url,
++            relativePath: relativePath,
++            architectures: architecturesOfMachO(url),
++            isEncrypted: (try? isProtectedMachO(url)) ?? false,
++            isMainExecutable: url.path == executableURL.path,
++            fileSize: Int64(fileSize),
++            loadedDylibs: loadedDylibs,
++            runtimePaths: runtimePaths,
++            hasBackup: hasAlternate(url)
++        )
++    }
++
++    fileprivate static func cpuTypeDescription(cpuType: UInt32, cpuSubtype: UInt32) -> String {
++        switch cpuType {
++        case 0x0100_000C:
++            return cpuSubtype == 2 ? "arm64e" : "arm64"
++        case 0x0000_000C:
++            return "armv7"
++        case 0x0100_0007:
++            return "x86_64"
++        case 0x0000_0007:
++            return "i386"
++        default:
++            return String(format: "cpu(0x%08X)", cpuType)
++        }
++    }
++}
+diff --git a/TrollFools/PlugInCell.swift b/TrollFools/PlugInCell.swift
+index afff401..f2c7a62 100644
+--- a/TrollFools/PlugInCell.swift
++++ b/TrollFools/PlugInCell.swift
+@@ -24,14 +24,27 @@ struct PlugInCell: View {
+ 
+     let plugIn: InjectedPlugIn
+ 
+-    init(_ plugIn: InjectedPlugIn, quickLookExport: Binding<URL?>) {
++    var onRenameRequest: ((InjectedPlugIn) -> Void)?
++    var onReplaceRequest: ((InjectedPlugIn) -> Void)?
++    var onFrameworkRequest: ((InjectedPlugIn) -> Void)?
++
++    init(
++        _ plugIn: InjectedPlugIn,
++        quickLookExport: Binding<URL?>,
++        onRenameRequest: ((InjectedPlugIn) -> Void)? = nil,
++        onReplaceRequest: ((InjectedPlugIn) -> Void)? = nil,
++        onFrameworkRequest: ((InjectedPlugIn) -> Void)? = nil
++    ) {
+         self.plugIn = plugIn
+         _quickLookExport = quickLookExport
++        self.onRenameRequest = onRenameRequest
++        self.onReplaceRequest = onReplaceRequest
++        self.onFrameworkRequest = onFrameworkRequest
+     }
+ 
+     @available(iOS 15, *)
+     var highlightedName: AttributedString {
+-        let name = plugIn.url.lastPathComponent
++        let name = plugIn.displayName
+         var attributedString = AttributedString(name)
+         if let range = attributedString.range(of: ejectList.filter.searchKeyword, options: [.caseInsensitive, .diacriticInsensitive]) {
+             attributedString[range].foregroundColor = .accentColor
+@@ -70,7 +83,7 @@ struct PlugInCell: View {
+                             .font(.headline)
+                             .lineLimit(2)
+                     } else {
+-                        Text(plugIn.url.lastPathComponent)
++                        Text(plugIn.displayName)
+                             .font(.headline)
+                             .lineLimit(2)
+                     }
+@@ -88,6 +101,18 @@ struct PlugInCell: View {
+             ejectList.togglePlugIn(plugIn, isEnabled: value)
+         }
+         .contextMenu {
++            Button {
++                onRenameRequest?(plugIn)
++            } label: {
++                Label(NSLocalizedString("Rename", comment: ""), systemImage: "pencil")
++            }
++
++            Button {
++                onReplaceRequest?(plugIn)
++            } label: {
++                Label(NSLocalizedString("Replace", comment: ""), systemImage: "arrow.triangle.2.circlepath")
++            }
++
+             if #available(iOS 16.4, *) {
+                 ShareLink(item: plugIn.url) {
+                     Label(NSLocalizedString("Export", comment: ""), systemImage: "square.and.arrow.up")
+@@ -110,6 +135,12 @@ struct PlugInCell: View {
+                 }
+             }
+             .disabled(!isFilzaInstalled)
++
++            Button {
++                onFrameworkRequest?(plugIn)
++            } label: {
++                Label(NSLocalizedString("Framework", comment: ""), systemImage: "shippingbox")
++            }
+         }
+     }
+ 
+@@ -123,3 +154,292 @@ struct PlugInCell: View {
+         ejectList.app.appList?.openInFilza(plugIn.url)
+     }
+ }
++
++// MARK: - Rename
++
++struct PlugInRenameView: View {
++    @EnvironmentObject var ejectList: EjectListModel
++    @Environment(\.presentationMode) var presentationMode
++
++    let plugIn: InjectedPlugIn
++
++    @State var text: String = ""
++
++    init(plugIn: InjectedPlugIn) {
++        self.plugIn = plugIn
++    }
++
++    var body: some View {
++        NavigationView {
++            Form {
++                Section {
++                    TextField(plugIn.url.lastPathComponent, text: $text)
++                } header: {
++                    Text(NSLocalizedString("Display Name", comment: ""))
++                } footer: {
++                    Text(NSLocalizedString("Leave it empty to restore the original file name.", comment: ""))
++                        .font(.footnote)
++                }
++            }
++            .navigationTitle(NSLocalizedString("Rename", comment: ""))
++            .navigationBarTitleDisplayMode(.inline)
++            .toolbar {
++                ToolbarItem(placement: .navigationBarLeading) {
++                    Button {
++                        presentationMode.wrappedValue.dismiss()
++                    } label: {
++                        Text(NSLocalizedString("Cancel", comment: ""))
++                    }
++                }
++
++                ToolbarItem(placement: .navigationBarTrailing) {
++                    Button {
++                        ejectList.setAlias(text, for: plugIn)
++                        presentationMode.wrappedValue.dismiss()
++                    } label: {
++                        Text(NSLocalizedString("Save", comment: ""))
++                    }
++                }
++            }
++        }
++        .onAppear {
++            text = plugIn.alias ?? ""
++        }
++    }
++}
++
++// MARK: - Framework
++
++struct PlugInFrameworkView: View {
++    @Environment(\.presentationMode) var presentationMode
++
++    let app: App
++    let plugIn: InjectedPlugIn
++
++    var onCompleted: ((URL) -> Void)?
++
++    @State var currentURL: URL
++    @State var entries: [MachOStructureEntry] = []
++    @State var isProcessing = false
++    @State var statusMessage: String?
++    @State var errorMessage: String?
++
++    init(app: App, plugIn: InjectedPlugIn, onCompleted: ((URL) -> Void)? = nil) {
++        self.app = app
++        self.plugIn = plugIn
++        self.onCompleted = onCompleted
++        _currentURL = State(initialValue: plugIn.url)
++    }
++
++    var structureKind: PlugInStructureKind {
++        PlugInStructureKind(rawValue: currentURL.pathExtension.lowercased()) ?? .unsupported
++    }
++
++    var structureIconName: String {
++        switch structureKind {
++        case .dylib: "bandage"
++        case .framework: "shippingbox"
++        case .bundle: "archivebox"
++        case .unsupported: "puzzlepiece"
++        }
++    }
++
++    var body: some View {
++        NavigationView {
++            List {
++                Section {
++                    HStack(spacing: 12) {
++                        Image(systemName: structureIconName)
++                            .foregroundColor(.accentColor)
++
++                        VStack(alignment: .leading, spacing: 4) {
++                            Text(currentURL.lastPathComponent)
++                                .font(.headline)
++                                .lineLimit(2)
++
++                            Text(String(format: NSLocalizedString("Current structure: %@", comment: ""), structureKind.localizedName))
++                                .font(.subheadline)
++                                .foregroundColor(.secondary)
++                        }
++                    }
++                } header: {
++                    Text(NSLocalizedString("Plug-In", comment: ""))
++                }
++
++                Section {
++                    if entries.isEmpty {
++                        Text(NSLocalizedString("No Mach-O found.", comment: ""))
++                            .foregroundColor(.secondary)
++                    } else {
++                        ForEach(entries) { entry in
++                            structureRow(entry)
++                        }
++                    }
++                } header: {
++                    Text(NSLocalizedString("App Structure", comment: ""))
++                }
++
++                Section {
++                    if structureKind == .dylib {
++                        Button {
++                            restructure(asFramework: true)
++                        } label: {
++                            Label(NSLocalizedString("Convert to Framework Structure", comment: ""), systemImage: "shippingbox")
++                        }
++                        .disabled(isProcessing)
++                    } else if structureKind == .framework {
++                        Button {
++                            restructure(asFramework: false)
++                        } label: {
++                            Label(NSLocalizedString("Convert to Dylib Structure", comment: ""), systemImage: "bandage")
++                        }
++                        .disabled(isProcessing)
++                    }
++
++                    if isProcessing {
++                        HStack(spacing: 8) {
++                            ProgressView()
++                            Text(NSLocalizedString("Processing…", comment: ""))
++                                .foregroundColor(.secondary)
++                        }
++                    }
++
++                    if let statusMessage {
++                        Text(statusMessage)
++                            .foregroundColor(.secondary)
++                    }
++
++                    if let errorMessage {
++                        Text(errorMessage)
++                            .foregroundColor(Color(.systemRed))
++                    }
++                } header: {
++                    Text(NSLocalizedString("Restructure", comment: ""))
++                } footer: {
++                    Text(NSLocalizedString("The plug-in will be relocated into Frameworks/ and every load command pointing at it will be rewritten.", comment: ""))
++                        .font(.footnote)
++                }
++            }
++            .listStyle(.insetGrouped)
++            .navigationTitle(NSLocalizedString("Framework", comment: ""))
++            .navigationBarTitleDisplayMode(.inline)
++            .toolbar {
++                ToolbarItem(placement: .navigationBarTrailing) {
++                    Button {
++                        presentationMode.wrappedValue.dismiss()
++                    } label: {
++                        Text(NSLocalizedString("Done", comment: ""))
++                    }
++                }
++            }
++        }
++        .onAppear {
++            reloadStructure()
++        }
++    }
++
++    @ViewBuilder
++    private func structureRow(_ entry: MachOStructureEntry) -> some View {
++        VStack(alignment: .leading, spacing: 4) {
++            HStack(spacing: 6) {
++                Text(entry.relativePath)
++                    .font(.subheadline)
++                    .lineLimit(2)
++
++                if entry.isMainExecutable {
++                    Text(NSLocalizedString("Main", comment: ""))
++                        .font(.caption2)
++                        .padding(.horizontal, 6)
++                        .padding(.vertical, 2)
++                        .background(Color.accentColor.opacity(0.15))
++                        .cornerRadius(4)
++                }
++            }
++
++            HStack(spacing: 8) {
++                Text(entry.architecturesDescription)
++                Text(entry.fileSizeDescription)
++                if entry.isEncrypted {
++                    Text(NSLocalizedString("Encrypted", comment: ""))
++                        .foregroundColor(Color(.systemOrange))
++                }
++                if entry.hasBackup {
++                    Text(NSLocalizedString("Patched", comment: ""))
++                        .foregroundColor(.accentColor)
++                }
++            }
++            .font(.caption)
++            .foregroundColor(.secondary)
++
++            if !entry.loadedDylibs.isEmpty {
++                Text(entry.loadedDylibs.joined(separator: "\n"))
++                    .font(.caption2)
++                    .foregroundColor(.secondary)
++                    .lineLimit(6)
++            }
++        }
++        .padding(.vertical, 2)
++    }
++
++    private func makeInjector() throws -> InjectorV3 {
++        let injector = try InjectorV3(app.url)
++        if injector.appID.isEmpty {
++            injector.appID = app.bid
++        }
++        if injector.teamID.isEmpty {
++            injector.teamID = app.teamID
++        }
++        return injector
++    }
++
++    private func reloadStructure() {
++        guard let injector = try? makeInjector() else {
++            return
++        }
++
++        DispatchQueue.global(qos: .userInitiated).async {
++            let newEntries = injector.structureEntriesInBundle()
++            DispatchQueue.main.async {
++                self.entries = newEntries
++            }
++        }
++    }
++
++    private func restructure(asFramework: Bool) {
++        guard !isProcessing else {
++            return
++        }
++
++        guard let injector = try? makeInjector() else {
++            errorMessage = NSLocalizedString("Unable to load the target application.", comment: "")
++            return
++        }
++
++        isProcessing = true
++        errorMessage = nil
++        statusMessage = nil
++
++        let targetURL = currentURL
++
++        DispatchQueue.global(qos: .userInitiated).async {
++            do {
++                let newURL = asFramework
++                    ? try injector.convertAssetToFramework(targetURL)
++                    : try injector.convertAssetToDylib(targetURL)
++
++                DispatchQueue.main.async {
++                    self.isProcessing = false
++                    self.currentURL = newURL
++                    self.statusMessage = NSLocalizedString("Done.", comment: "")
++                    self.reloadStructure()
++                    self.onCompleted?(newURL)
++                }
++            } catch {
++                DispatchQueue.main.async {
++                    self.isProcessing = false
++                    self.errorMessage = error.localizedDescription
++                }
++            }
++        }
++    }
++}
+diff --git a/TrollFools/Version.xcconfig b/TrollFools/Version.xcconfig
+index c2385d1..4046937 100644
+--- a/TrollFools/Version.xcconfig
++++ b/TrollFools/Version.xcconfig
+@@ -9,4 +9,4 @@
+ // https://help.apple.com/xcode/#/dev745c5c974
+ 
+ VERSION = 4.4.2
+-BUILD_NUMBER = 259
++BUILD_NUMBER = 260
+diff --git a/TrollFools/en.lproj/Localizable.strings b/TrollFools/en.lproj/Localizable.strings
+index 3053ba7..70e8423 100644
+--- a/TrollFools/en.lproj/Localizable.strings
++++ b/TrollFools/en.lproj/Localizable.strings
+@@ -315,3 +315,78 @@
+ 
+ /* No comment provided by engineer. */
+ "You’ve selected at least one Debian Package “%@”. We’re here to remind you that it will not work as it was in a jailbroken environment. Please make sure you know what you’re doing." = "You’ve selected at least one Debian Package “%@”. We’re here to remind you that it will not work as it was in a jailbroken environment. Please make sure you know what you’re doing.";
++
++/* No comment provided by engineer. */
++"App Structure" = "App Structure";
++
++/* No comment provided by engineer. */
++"Convert to Dylib Structure" = "Convert to Dylib Structure";
++
++/* No comment provided by engineer. */
++"Convert to Framework Structure" = "Convert to Framework Structure";
++
++/* No comment provided by engineer. */
++"Current structure: %@" = "Current structure: %@";
++
++/* No comment provided by engineer. */
++"Display Name" = "Display Name";
++
++/* No comment provided by engineer. */
++"Done." = "Done.";
++
++/* No comment provided by engineer. */
++"Dylib" = "Dylib";
++
++/* No comment provided by engineer. */
++"Encrypted" = "Encrypted";
++
++/* No comment provided by engineer. */
++"Framework" = "Framework";
++
++/* No comment provided by engineer. */
++"Leave it empty to restore the original file name." = "Leave it empty to restore the original file name.";
++
++/* No comment provided by engineer. */
++"Main" = "Main";
++
++/* No comment provided by engineer. */
++"No Mach-O found." = "No Mach-O found.";
++
++/* No comment provided by engineer. */
++"Only injected plug-ins can be restructured." = "Only injected plug-ins can be restructured.";
++
++/* No comment provided by engineer. */
++"Plug-In" = "Plug-In";
++
++/* No comment provided by engineer. */
++"Plug-in not found: %@" = "Plug-in not found: %@";
++
++/* No comment provided by engineer. */
++"Processing…" = "Processing…";
++
++/* No comment provided by engineer. */
++"Rename" = "Rename";
++
++/* No comment provided by engineer. */
++"Replace" = "Replace";
++
++/* No comment provided by engineer. */
++"Restructure" = "Restructure";
++
++/* No comment provided by engineer. */
++"Save" = "Save";
++
++/* No comment provided by engineer. */
++"The plug-in will be relocated into Frameworks/ and every load command pointing at it will be rewritten." = "The plug-in will be relocated into Frameworks/ and every load command pointing at it will be rewritten.";
++
++/* No comment provided by engineer. */
++"This plug-in is not a dylib." = "This plug-in is not a dylib.";
++
++/* No comment provided by engineer. */
++"This plug-in is not a framework." = "This plug-in is not a framework.";
++
++/* No comment provided by engineer. */
++"Unable to load the target application." = "Unable to load the target application.";
++
++/* No comment provided by engineer. */
++"Unknown" = "Unknown";
+diff --git a/TrollFools/zh-Hans.lproj/Localizable.strings b/TrollFools/zh-Hans.lproj/Localizable.strings
+index d51081a..ac285b3 100644
+--- a/TrollFools/zh-Hans.lproj/Localizable.strings
++++ b/TrollFools/zh-Hans.lproj/Localizable.strings
+@@ -315,3 +315,78 @@
+ 
+ /* No comment provided by engineer. */
+ "You’ve selected at least one Debian Package “%@”. We’re here to remind you that it will not work as it was in a jailbroken environment. Please make sure you know what you’re doing." = "你至少选择了一个 Debian 软件包 “%@”。请留意，它通常不会像在越狱环境当中那样工作，甚至完全不起作用。请确保你知道自己在做些什么。";
++
++/* No comment provided by engineer. */
++"App Structure" = "应用结构";
++
++/* No comment provided by engineer. */
++"Convert to Dylib Structure" = "还原为 Dylib 结构";
++
++/* No comment provided by engineer. */
++"Convert to Framework Structure" = "转换为 Framework 结构";
++
++/* No comment provided by engineer. */
++"Current structure: %@" = "当前结构:%@";
++
++/* No comment provided by engineer. */
++"Display Name" = "显示名称";
++
++/* No comment provided by engineer. */
++"Done." = "完成。";
++
++/* No comment provided by engineer. */
++"Dylib" = "Dylib";
++
++/* No comment provided by engineer. */
++"Encrypted" = "已加密";
++
++/* No comment provided by engineer. */
++"Framework" = "Framework";
++
++/* No comment provided by engineer. */
++"Leave it empty to restore the original file name." = "留空即可恢复原始文件名。";
++
++/* No comment provided by engineer. */
++"Main" = "主程序";
++
++/* No comment provided by engineer. */
++"No Mach-O found." = "未找到 Mach-O。";
++
++/* No comment provided by engineer. */
++"Only injected plug-ins can be restructured." = "只有已注入的插件才能调整结构。";
++
++/* No comment provided by engineer. */
++"Plug-In" = "插件";
++
++/* No comment provided by engineer. */
++"Plug-in not found: %@" = "找不到插件:%@";
++
++/* No comment provided by engineer. */
++"Processing…" = "处理中…";
++
++/* No comment provided by engineer. */
++"Rename" = "备注";
++
++/* No comment provided by engineer. */
++"Replace" = "替换";
++
++/* No comment provided by engineer. */
++"Restructure" = "结构调整";
++
++/* No comment provided by engineer. */
++"Save" = "保存";
++
++/* No comment provided by engineer. */
++"The plug-in will be relocated into Frameworks/ and every load command pointing at it will be rewritten." = "插件将被移入 Frameworks/ 目录，并重写所有指向它的加载命令。";
++
++/* No comment provided by engineer. */
++"This plug-in is not a dylib." = "这个插件不是 dylib。";
++
++/* No comment provided by engineer. */
++"This plug-in is not a framework." = "这个插件不是 framework。";
++
++/* No comment provided by engineer. */
++"Unable to load the target application." = "无法加载目标应用。";
++
++/* No comment provided by engineer. */
++"Unknown" = "未知";
